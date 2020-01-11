@@ -1,0 +1,283 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+labels:
+  template: mysql-persistent-template
+message: |-
+  The following service(s) have been created in your project: ${DATABASE_SERVICE_NAME}.
+
+         Username: root
+         Password: ${MYSQL_PASSWORD}
+   Connection URL: mysql://${DATABASE_SERVICE_NAME}:3306/
+
+  For more information about using this template, including OpenShift considerations, see https://github.com/sclorg/mysql-container/blob/master/5.7/root/usr/share/container-scripts/mysql/README.md.
+metadata:
+  annotations:
+    description: |-
+      This is a test.
+
+      WARNING: Any data stored will be lost upon pod destruction. Only use this template for testing
+    iconClass: icon-mysql
+    openshift.io/display-name: MySQL (Galera)
+    openshift.io/documentation-url: https://github.com/sclorg/mariadb-container/blob/master/10.2/root/usr/share/container-scripts/mysql/README.md
+    openshift.io/long-description: This template provides a standalone MySQL server
+      with a database created.  The database is not stored on persistent storage,
+      so any restart of the service will result in all data being lost.  The database
+      name, username, and password are chosen via parameters when provisioning this
+      service.
+    openshift.io/provider-display-name: Red Hat, Inc.
+    openshift.io/support-url: https://access.redhat.com
+    tags: database,mysql
+  name: mysql-galera
+  namespace: openshift
+objects:
+- apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+      name: pv-${DATABASE_SERVICE_NAME}-0
+  spec:
+    accessModes:
+      - ${PV_ACCESSMODES}
+    capacity:
+      storage: ${PV_STORAGE}
+    nfs:
+      path: ${PV_NFS_PATH}/datadir-mysql-0
+      server: ${PV_NFS_SERVER}
+- apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+      name: pv-${DATABASE_SERVICE_NAME}-1
+  spec:
+    accessModes:
+      - ${PV_ACCESSMODES}
+    capacity:
+      storage: ${PV_STORAGE}
+    nfs:
+      path: ${PV_NFS_PATH}/datadir-mysql-1
+      server: ${PV_NFS_SERVER}
+- apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+      name: pv-${DATABASE_SERVICE_NAME}-2
+  spec:
+    accessModes:
+      - ${PV_ACCESSMODES}
+    capacity:
+      storage: ${PV_STORAGE}
+    nfs:
+      path: ${PV_NFS_PATH}/datadir-mysql-2
+      server: ${PV_NFS_SERVER}
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: ${DATABASE_SERVICE_NAME}
+  type: Opaque
+  data:
+    password: ${MYSQL_PASSWORD}
+
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ${DATABASE_SERVICE_NAME}
+  data:
+    galera.cnf: |
+      [galera]
+      user = mysql
+      bind-address = 0.0.0.0
+
+      default_storage_engine = InnoDB
+      binlog_format = ROW
+      innodb_autoinc_lock_mode = 2
+      innodb_flush_log_at_trx_commit = 0
+      query_cache_size = 0
+      query_cache_type = 0
+
+      # MariaDB Galera settings
+      wsrep_on=ON
+      wsrep_provider=/usr/lib/galera/libgalera_smm.so
+      wsrep_sst_method=rsync
+
+      # Cluster settings (automatically updated)
+      wsrep_cluster_address=gcomm://
+      wsrep_cluster_name=mysql
+      wsrep_node_address=127.0.0.1
+    mariadb.cnf: |
+      [client]
+      default-character-set = utf8
+      [mysqld]
+      character-set-server  = utf8
+      collation-server      = utf8_general_ci
+      # InnoDB tuning
+      innodb_log_file_size  = 50M
+
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+    name: galera
+    labels:
+      app: ${DATABASE_SERVICE_NAME}
+  spec:
+    ports:
+    - port: 3306
+      name: ${DATABASE_SERVICE_NAME}
+    clusterIP: None
+    selector:
+      app: ${DATABASE_SERVICE_NAME}
+
+- apiVersion: apps/v1beta1
+  kind: StatefulSet
+  metadata:
+    name: ${DATABASE_SERVICE_NAME}
+  spec:
+    serviceName: "galera"
+    replicas: 3
+    template:
+      metadata:
+        labels:
+          app: ${DATABASE_SERVICE_NAME}
+      spec:
+        initContainers:
+        - name: copy-mysql-config
+          image: busybox
+          command: ['sh', '-c', 'cp /configmap/* /etc/mysql/conf.d']
+          volumeMounts:
+          - name: ${DATABASE_SERVICE_NAME}-configmap
+            mountPath: /configmap
+          - name: ${DATABASE_SERVICE_NAME}-config
+            mountPath: /etc/mysql/conf.d
+        containers:
+        - name: ${DATABASE_SERVICE_NAME}
+          image: ${MYSQL_IMAGE_NAME}:${MYSQL_IMAGE_VERSION}
+          ports:
+          - containerPort: 3306
+            name: mysql
+          - containerPort: 4444
+            name: sst
+          - containerPort: 4567
+            name: replication
+          - containerPort: 4568
+            name: ist
+          env:
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+          - name: MYSQL_ROOT_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: password
+                name: ${DATABASE_SERVICE_NAME}
+          readinessProbe:
+            exec:
+              command: ["bash", "-c", "mysql -u root -p\"${MYSQL_ROOT_PASSWORD}\" -h 127.0.0.1  -e 'show databases;'"]
+            initialDelaySeconds: 20
+            timeoutSeconds: 5
+          resources:
+            limits:
+              memory: ${MEMORY_LIMIT}
+          volumeMounts:
+          - name: ${DATABASE_SERVICE_NAME}-config
+            mountPath: /etc/mysql/conf.d
+          - name: ${DATABASE_SERVICE_NAME}-datadir
+            mountPath: /var/lib/mysql
+        volumes:
+        - name: ${DATABASE_SERVICE_NAME}-config
+          emptyDir: {}
+        - name: ${DATABASE_SERVICE_NAME}-configmap
+          configMap:
+            name: ${DATABASE_SERVICE_NAME}
+            items:
+              - path: "galera.cnf"
+                key: galera.cnf
+              - path: "mariadb.cnf"
+                key: mariadb.cnf
+    volumeClaimTemplates:
+    - metadata:
+        name: ${DATABASE_SERVICE_NAME}-datadir
+      spec:
+        accessModes: [ "${PVC_ACCESSMODES}" ]
+        resources:
+          requests:
+            storage: ${PVC_STORAGE}
+    triggers:
+    - imageChangeParams:
+        automatic: true
+        containerNames:
+        - ${DATABASE_SERVICE_NAME}
+        from:
+          kind: ImageStreamTag
+          name: ${MYSQL_IMAGE_NAME}:${MYSQL_IMAGE_VERSION}
+          namespace: openshift
+      type: ImageChange
+    - type: ConfigChange
+parameters:
+- description: The name of the OpenShift Service exposed for the database.
+  displayName: Database Service Name
+  name: DATABASE_SERVICE_NAME
+  required: true
+  value: mysql
+  disable: false
+- description: Password for the MySQL connection user.
+  displayName: MySQL Connection Password
+  name: MYSQL_PASSWORD
+  required: true
+  disable: false
+- description: Name of MySQL image to be used.
+  displayName: Name of MySQL Image
+  name: MYSQL_IMAGE_NAME
+  required: true
+  value: ausov/k8s-mariadb-cluster
+  disable: true
+- description: Version of MySQL image to be used.
+  displayName: Version of MySQL Image
+  name: MYSQL_IMAGE_VERSION
+  required: true
+  value: latest
+  disable: true
+- description: PersistentVolume NFS storage server.
+  displayName: NFS server
+  name: PV_NFS_SERVER
+  required: true
+  disable: false
+- description: PersistentVolume NFS storage path.
+  displayName: NFS path
+  name: PV_NFS_PATH
+  required: true
+  value: /mnt/scq_test/mysql
+  disable: false
+- description: PersistentVolume accessModes (ReadWriteMany, ReadWriteOnce or ReadOnlyMany).
+  displayName: PersistentVolume accessModes
+  name: PV_ACCESSMODES
+  required: true
+  value: ReadWriteMany
+  disable: false
+- description: PersistentVolume capacity storage.
+  displayName: PersistentVolume capacity
+  name: PV_STORAGE
+  required: true
+  value: 2G
+  disable: false
+- description: PersistentVolumeClaim accessModes (ReadWriteMany, ReadWriteOnce or ReadOnlyMany).
+  displayName: PersistentVolumeClaim accessModes
+  name: PVC_ACCESSMODES
+  required: true
+  value: ReadWriteMany
+  disable: false
+- description: PersistentVolumeClaim capacity storage.
+  displayName: PersistentVolumeClaim capacity
+  name: PVC_STORAGE
+  required: true
+  value: 2G
+  disable: false
+#- description: The OpenShift Namespace where the ImageStream resides.
+#  displayName: Namespace
+#  name: NAMESPACE
+#  value: openshift
+- description: Maximum amount of memory the container can use.
+  displayName: Memory Limit
+  name: MEMORY_LIMIT
+  required: true
+  value: 512Mi
+  disable: false

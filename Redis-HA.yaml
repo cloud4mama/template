@@ -1,0 +1,527 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+labels:
+  template: redis-persistent-template
+message: |-
+  The following service(s) have been created in your project: ${REDIS_SERVICE_NAME}.
+
+  For more information about using this template, including OpenShift considerations, see https://github.com/helm/charts/tree/master/stable/redis-ha.
+metadata:
+  annotations:
+    description: |-
+      One pod containing a redis master and sentinel container (optional prometheus metrics exporter sidecar available),Two pods each containing a redis slave and sentinel containers (optional prometheus metrics exporter sidecars available).
+
+      WARNING: Any data stored will be lost upon pod destruction. Only use this template for testing
+    iconClass: icon-redis
+    openshift.io/display-name: Redis (HA)
+    openshift.io/documentation-url: https://github.com/helm/charts/tree/master/stable/redis-ha
+    openshift.io/long-description: This template provides a standalone Redis server.
+    openshift.io/provider-display-name: Red Hat, Inc.
+    openshift.io/support-url: https://access.redhat.com
+    tags: database,redis
+  name: redis-ha
+  namespace: openshift
+
+objects:
+- apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+     name: pv-${REDIS_SERVICE_NAME}-0
+  spec:
+   accessModes:
+     - ${PV_ACCESSMODES}
+   capacity:
+     storage: ${PV_STORAGE}
+   nfs:
+     path: ${PV_NFS_PATH}/data-redis-0
+     server: ${PV_NFS_SERVER}
+- apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+     name: pv-${REDIS_SERVICE_NAME}-1
+  spec:
+   accessModes:
+     - ${PV_ACCESSMODES}
+   capacity:
+     storage: ${PV_STORAGE}
+   nfs:
+     path: ${PV_NFS_PATH}/data-redis-1
+     server: ${PV_NFS_SERVER}
+- apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+     name: pv-${REDIS_SERVICE_NAME}-2
+  spec:
+   accessModes:
+     - ${PV_ACCESSMODES}
+   capacity:
+     storage: ${PV_STORAGE}
+   nfs:
+     path: ${PV_NFS_PATH}/data-redis-2
+     server: ${PV_NFS_SERVER}
+
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: ${REDIS_SERVICE_NAME}
+  type: Opaque
+  data:
+    password: ${REDIS_PASSWORD}
+
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ${REDIS_SERVICE_NAME}
+  data:
+    redis.conf: |
+      dir "/data"
+      port 6379
+      maxmemory 0
+      maxmemory-policy volatile-lru
+      min-replicas-max-lag 5
+      min-replicas-to-write 1
+      rdbchecksum yes
+      rdbcompression yes
+      repl-diskless-sync yes
+      save 900 1
+      requirepass replace-default-auth
+      masterauth replace-default-auth
+
+    sentinel.conf: |
+      dir "/data"
+      sentinel down-after-milliseconds mymaster 10000
+      sentinel failover-timeout mymaster 180000
+      sentinel parallel-syncs mymaster 5
+      sentinel auth-pass mymaster replace-default-auth
+
+    init.sh: |
+      SENTINEL_ID_0=$(printf "%s\n%s\nindex: %d" redis-ha redis 0 | sha1sum | awk '{print $1}')
+      SENTINEL_ID_1=$(printf "%s\n%s\nindex: %d" redis-ha redis 1 | sha1sum | awk '{print $1}')
+      SENTINEL_ID_2=$(printf "%s\n%s\nindex: %d" redis-ha redis 2 | sha1sum | awk '{print $1}')
+      HOSTNAME="$(hostname)"
+      INDEX="${HOSTNAME##*-}"
+      MASTER="$(redis-cli -h redis-redis-ha -p 26379 sentinel get-master-addr-by-name mymaster | grep -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}')"
+      MASTER_GROUP="mymaster"
+      QUORUM="2"
+      REDIS_CONF=/data/conf/redis.conf
+      REDIS_PORT=6379
+      SENTINEL_CONF=/data/conf/sentinel.conf
+      SENTINEL_PORT=26379
+      SERVICE=${REDIS_SERVICE_NAME}-redis-ha
+      set -eu
+
+      sentinel_update() {
+          echo "Updating sentinel config with master $MASTER"
+          eval MY_SENTINEL_ID="\${SENTINEL_ID_$INDEX}"
+          sed -i "1s/^/sentinel myid $MY_SENTINEL_ID\\n/" "$SENTINEL_CONF"
+          sed -i "2s/^/sentinel monitor $MASTER_GROUP $1 $REDIS_PORT $QUORUM \\n/" "$SENTINEL_CONF"
+          echo "sentinel announce-ip $ANNOUNCE_IP" >> $SENTINEL_CONF
+          echo "sentinel announce-port $SENTINEL_PORT" >> $SENTINEL_CONF
+      }
+
+      redis_update() {
+          echo "Updating redis config"
+          echo "slaveof $1 $REDIS_PORT" >> "$REDIS_CONF"
+          echo "slave-announce-ip $ANNOUNCE_IP" >> $REDIS_CONF
+          echo "slave-announce-port $REDIS_PORT" >> $REDIS_CONF
+      }
+
+      copy_config() {
+          cp /readonly-config/redis.conf "$REDIS_CONF"
+          cp /readonly-config/sentinel.conf "$SENTINEL_CONF"
+      }
+
+      setup_defaults() {
+          echo "Setting up defaults"
+          if [ "$INDEX" = "0" ]; then
+              echo "Setting this pod as the default master"
+              redis_update "$ANNOUNCE_IP"
+              sentinel_update "$ANNOUNCE_IP"
+              sed -i "s/^.*slaveof.*//" "$REDIS_CONF"
+          else
+              DEFAULT_MASTER="$(getent hosts "$SERVICE-announce-0" | awk '{ print $1 }')"
+              if [ -z "$DEFAULT_MASTER" ]; then
+                  echo "Unable to resolve host"
+                  exit 1
+              fi
+              echo "Setting default slave config.."
+              redis_update "$DEFAULT_MASTER"
+              sentinel_update "$DEFAULT_MASTER"
+          fi
+      }
+
+      find_master() {
+          echo "Attempting to find master"
+          if [ "$(redis-cli -h "$MASTER" -a "$AUTH" ping)" != "PONG" ]; then
+             echo "Can't ping master, attempting to force failover"
+             if redis-cli -h "$SERVICE" -p "$SENTINEL_PORT" sentinel failover "$MASTER_GROUP" | grep -q 'NOGOODSLAVE' ; then 
+                 setup_defaults
+                 return 0
+             fi
+             sleep 10
+             MASTER="$(redis-cli -h $SERVICE -p $SENTINEL_PORT sentinel get-master-addr-by-name $MASTER_GROUP | grep -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}')"
+             if [ "$MASTER" ]; then
+                 sentinel_update "$MASTER"
+                 redis_update "$MASTER"
+             else
+                echo "Could not failover, exiting..."
+                exit 1
+             fi
+          else
+              echo "Found reachable master, updating config"
+              sentinel_update "$MASTER"
+              redis_update "$MASTER"
+          fi
+      }
+
+      mkdir -p /data/conf/
+
+      echo "Initializing config.."
+      copy_config
+
+      ANNOUNCE_IP=$(getent hosts "$SERVICE-announce-$INDEX" | awk '{ print $1 }')
+      if [ -z "$ANNOUNCE_IP" ]; then
+          "Could not resolve the announce ip for this pod"
+          exit 1
+      elif [ "$MASTER" ]; then
+          find_master
+      else
+          setup_defaults
+      fi
+
+      if [ "${AUTH:-}" ]; then
+          echo "Setting auth values"
+          ESCAPED_AUTH=$(echo "$AUTH" | sed -e 's/[\/&]/\\&/g');
+          sed -i "s/replace-default-auth/${ESCAPED_AUTH}/" "$REDIS_CONF" "$SENTINEL_CONF"
+      fi
+
+      echo "Ready..."
+
+    haproxy_init.sh: |
+      HAPROXY_CONF=/data/haproxy.cfg
+      cp /readonly/haproxy.cfg "$HAPROXY_CONF"
+      for loop in $(seq 1 10); do
+        getent hosts redis-redis-ha-announce-0 && break
+        echo "Waiting for service redis-redis-ha-announce-0 to be ready ($loop) ..." && sleep 1
+      done
+      ANNOUNCE_IP0=$(getent hosts "redis-redis-ha-announce-0" | awk '{ print $1 }')
+      if [ -z "$ANNOUNCE_IP0" ]; then
+        echo "Could not resolve the announce ip for redis-redis-ha-announce-0"
+        exit 1
+      fi
+      sed -i "s/REPLACE_ANNOUNCE0/$ANNOUNCE_IP0/" "$HAPROXY_CONF"
+
+      if [ "${AUTH:-}" ]; then
+          echo "Setting auth values"
+          ESCAPED_AUTH=$(echo "$AUTH" | sed -e 's/[\/&]/\\&/g');
+          sed -i "s/REPLACE_AUTH_SECRET/${ESCAPED_AUTH}/" "$HAPROXY_CONF"
+      fi
+      for loop in $(seq 1 10); do
+        getent hosts redis-redis-ha-announce-1 && break
+        echo "Waiting for service redis-redis-ha-announce-1 to be ready ($loop) ..." && sleep 1
+      done
+      ANNOUNCE_IP1=$(getent hosts "redis-redis-ha-announce-1" | awk '{ print $1 }')
+      if [ -z "$ANNOUNCE_IP1" ]; then
+        echo "Could not resolve the announce ip for redis-redis-ha-announce-1"
+        exit 1
+      fi
+      sed -i "s/REPLACE_ANNOUNCE1/$ANNOUNCE_IP1/" "$HAPROXY_CONF"
+
+      if [ "${AUTH:-}" ]; then
+          echo "Setting auth values"
+          ESCAPED_AUTH=$(echo "$AUTH" | sed -e 's/[\/&]/\\&/g');
+          sed -i "s/REPLACE_AUTH_SECRET/${ESCAPED_AUTH}/" "$HAPROXY_CONF"
+      fi
+      for loop in $(seq 1 10); do
+        getent hosts redis-redis-ha-announce-2 && break
+        echo "Waiting for service redis-redis-ha-announce-2 to be ready ($loop) ..." && sleep 1
+      done
+      ANNOUNCE_IP2=$(getent hosts "redis-redis-ha-announce-2" | awk '{ print $1 }')
+      if [ -z "$ANNOUNCE_IP2" ]; then
+        echo "Could not resolve the announce ip for redis-redis-ha-announce-2"
+        exit 1
+      fi
+      sed -i "s/REPLACE_ANNOUNCE2/$ANNOUNCE_IP2/" "$HAPROXY_CONF"
+
+      if [ "${AUTH:-}" ]; then
+          echo "Setting auth values"
+          ESCAPED_AUTH=$(echo "$AUTH" | sed -e 's/[\/&]/\\&/g');
+          sed -i "s/REPLACE_AUTH_SECRET/${ESCAPED_AUTH}/" "$HAPROXY_CONF"
+      fi
+
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${REDIS_SERVICE_NAME}-redis-ha-announce-0
+    labels:
+      app: ${REDIS_SERVICE_NAME}-redis-ha
+    annotations:
+      service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+  spec:
+    publishNotReadyAddresses: true
+    type: ClusterIP
+    ports:
+    - name: server
+      port: 6379
+      protocol: TCP
+      targetPort: redis
+    - name: sentinel
+      port: 26379
+      protocol: TCP
+      targetPort: sentinel
+    selector:
+      app: ${REDIS_SERVICE_NAME}-redis-ha
+      "statefulset.kubernetes.io/pod-name": ${REDIS_SERVICE_NAME}-redis-ha-server-0
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${REDIS_SERVICE_NAME}-redis-ha-announce-2
+    labels:
+      app: ${REDIS_SERVICE_NAME}-redis-ha
+    annotations:
+      service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+  spec:
+    publishNotReadyAddresses: true
+    type: ClusterIP
+    ports:
+    - name: server
+      port: 6379
+      protocol: TCP
+      targetPort: redis
+    - name: sentinel
+      port: 26379
+      protocol: TCP
+      targetPort: sentinel
+    selector:
+      app: ${REDIS_SERVICE_NAME}-redis-ha
+      "statefulset.kubernetes.io/pod-name": ${REDIS_SERVICE_NAME}-redis-ha-server-2
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${REDIS_SERVICE_NAME}-redis-ha-announce-1
+    labels:
+      app: ${REDIS_SERVICE_NAME}-redis-ha
+    annotations:
+      service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+  spec:
+    publishNotReadyAddresses: true
+    type: ClusterIP
+    ports:
+    - name: server
+      port: 6379
+      protocol: TCP
+      targetPort: redis
+    - name: sentinel
+      port: 26379
+      protocol: TCP
+      targetPort: sentinel
+    selector:
+      app: ${REDIS_SERVICE_NAME}-redis-ha
+      "statefulset.kubernetes.io/pod-name": ${REDIS_SERVICE_NAME}-redis-ha-server-1
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${REDIS_SERVICE_NAME}-redis-ha
+    labels:
+      app: ${REDIS_SERVICE_NAME}-redis-ha
+  spec:
+    type: ClusterIP
+    clusterIP: None
+    ports:
+    - name: server
+      port: 6379
+      protocol: TCP
+      targetPort: redis
+    - name: sentinel
+      port: 26379
+      protocol: TCP
+      targetPort: sentinel
+    selector:
+      app: ${REDIS_SERVICE_NAME}-redis-ha
+
+- apiVersion: apps/v1
+  kind: StatefulSet
+  metadata:
+    name: ${REDIS_SERVICE_NAME}-redis-ha-server
+    labels:
+      app: ${REDIS_SERVICE_NAME}-redis-ha
+  spec:
+    selector:
+      matchLabels:
+        app: ${REDIS_SERVICE_NAME}-redis-ha
+    serviceName: ${REDIS_SERVICE_NAME}-redis-ha
+    replicas: 3
+    podManagementPolicy: OrderedReady
+    updateStrategy:
+      type: RollingUpdate
+    template:
+      metadata:
+        labels:
+          app: ${REDIS_SERVICE_NAME}-redis-ha
+      spec:
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: ${REDIS_SERVICE_NAME}-redis-ha
+                topologyKey: kubernetes.io/hostname
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  labelSelector:
+                    matchLabels:
+                      app:  ${REDIS_SERVICE_NAME}-redis-ha
+                  topologyKey: failure-domain.beta.kubernetes.io/zone
+        initContainers:
+        - name: config-init
+          image: ${IMAGE_NAME}:${IMAGE_VERSION}
+          imagePullPolicy: IfNotPresent   
+          command:
+          - sh
+          args:
+          - /readonly-config/init.sh
+          env:
+          - name: AUTH
+            valueFrom:
+              secretKeyRef:
+                name: ${REDIS_SERVICE_NAME}
+                key: password
+          volumeMounts:
+          - name: ${REDIS_SERVICE_NAME}-config
+            mountPath: /readonly-config
+            readOnly: true
+          - name: ${REDIS_SERVICE_NAME}-data
+            mountPath: /data
+        containers:
+        - name: ${REDIS_SERVICE_NAME}
+          image: ${IMAGE_NAME}:${IMAGE_VERSION}
+          imagePullPolicy: IfNotPresent
+          command:
+          - redis-server 
+          args:
+          - /data/conf/redis.conf
+          env:
+          - name: AUTH
+            valueFrom:
+              secretKeyRef:
+                name: ${REDIS_SERVICE_NAME}
+                key: password
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 15
+          resources:
+            limits:
+              memory: ${MEMORY_LIMIT}  
+          ports:
+          - name: redis
+            containerPort: 6379
+          volumeMounts:
+          - mountPath: /data
+            name: ${REDIS_SERVICE_NAME}-data
+        - name: sentinel
+          image: ${IMAGE_NAME}:${IMAGE_VERSION}
+          imagePullPolicy: IfNotPresent
+          command:
+            - redis-sentinel
+          args:
+            - /data/conf/sentinel.conf
+          env:
+          - name: AUTH
+            valueFrom:
+              secretKeyRef:
+                name: ${REDIS_SERVICE_NAME}
+                key: password
+          livenessProbe:
+            tcpSocket:
+              port: 26379
+            initialDelaySeconds: 15
+          resources:
+            limits:
+              memory: ${MEMORY_LIMIT}
+          ports:
+            - name: sentinel
+              containerPort: 26379
+          volumeMounts:
+          - mountPath: /data
+            name: ${REDIS_SERVICE_NAME}-data
+        volumes:
+        - name: ${REDIS_SERVICE_NAME}-config
+          configMap:
+            name: ${REDIS_SERVICE_NAME}
+    volumeClaimTemplates:
+    - metadata:
+        name: ${REDIS_SERVICE_NAME}-data
+      spec:
+        accessModes:
+          - "${PVC_ACCESSMODES}"
+        resources:
+          requests:
+            storage: ${PVC_STORAGE}
+    triggers:
+    - imageChangeParams:
+        automatic: true
+        containerNames:
+        - ${REDIS_SERVICE_NAME}
+        from:
+          kind: ImageStreamTag
+          name: ${IMAGE_NAME}:${IMAGE_VERSION}
+          namespace: openshift
+      type: ImageChange
+    - type: ConfigChange
+
+parameters:
+- description: Redis服务名称。
+  displayName: Redis Service Name
+  name: REDIS_SERVICE_NAME
+  required: true
+  value: redis
+- description: Redis连接密码。
+  displayName: Redis Connection Password
+  name: REDIS_PASSWORD
+  required: true
+- description: Redis所使用镜像名称。
+  displayName: Name of Redis Image
+  name: IMAGE_NAME
+  required: true
+  value: redis
+- description: Redis所使用镜像版本。
+  displayName: Version of Redis Image
+  name: IMAGE_VERSION
+  required: true
+  value: 5.0.6-alpine
+- description: NFS服务器的地址。
+  displayName: NFS server
+  name: PV_NFS_SERVER
+  required: true
+- description: NFS服务器的存储路径。
+  displayName: NFS path
+  name: PV_NFS_PATH
+  required: true
+  value: /mnt/scq_test/redis
+- description: PersistentVolume的访问模式(ReadWriteMany, ReadWriteOnce or ReadOnlyMany)。
+  displayName: PersistentVolume accessModes
+  name: PV_ACCESSMODES
+  required: true
+  value: ReadWriteMany
+- description: PersistentVolume的所需存储空间大小。
+  displayName: PersistentVolume capacity
+  name: PV_STORAGE
+  required: true
+  value: 2G
+- description: PersistentVolumeClaim的访问模式(ReadWriteMany, ReadWriteOnce or ReadOnlyMany)。
+  displayName: PersistentVolumeClaim accessModes
+  name: PVC_ACCESSMODES
+  required: true
+  value: ReadWriteMany
+- description: PersistentVolumeClaim的所需存储空间大小。
+  displayName: PersistentVolumeClaim capacity
+  name: PVC_STORAGE
+  required: true
+  value: 2G
+- description: Redis可以使用的最大内存。
+  displayName: Memory Limit
+  name: MEMORY_LIMIT
+  required: true
+  value: 512M

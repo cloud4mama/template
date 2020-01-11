@@ -1,0 +1,291 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+labels:
+  template: kafka-persistent-template
+message: |-
+  The following service(s) have been created in your project: ${KAFKA_SERVICE_NAME}.
+
+  For more information about using this template, including OpenShift considerations, see http://www.mydlq.club/article/29/.
+metadata:
+  annotations:
+    description: |-
+      see http://www.mydlq.club/article/29/.
+
+      WARNING: Any data stored will be lost upon pod destruction. Only use this template for testing
+    iconClass: icon-kafka
+    openshift.io/display-name: Kafka (HA)
+    openshift.io/documentation-url: http://www.mydlq.club/article/29/
+    openshift.io/long-description: This template provides a standalone RabbitMQ server.
+    openshift.io/provider-display-name: Red Hat, Inc.
+    openshift.io/support-url: https://access.redhat.com
+    tags: database,kafka
+  name: kafka-ha
+  namespace: openshift
+
+objects:
+- apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+     name: pv-${KAFKA_SERVICE_NAME}-0
+     labels:
+       app: ${KAFKA_SERVICE_NAME}
+  spec:
+   accessModes:
+     - ${PV_ACCESSMODES}
+   capacity:
+     storage: ${PV_STORAGE}
+   nfs:
+     path: ${PV_NFS_PATH}/data-kafka-0
+     server: ${PV_NFS_SERVER}
+- apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+     name: pv-${KAFKA_SERVICE_NAME}-1
+     labels:
+       app: ${KAFKA_SERVICE_NAME}
+  spec:
+   accessModes:
+     - ${PV_ACCESSMODES}
+   capacity:
+     storage: ${PV_STORAGE}
+   nfs:
+     path: ${PV_NFS_PATH}/data-kafka-1
+     server: ${PV_NFS_SERVER}
+- apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+     name: pv-${KAFKA_SERVICE_NAME}-2
+     labels:
+       app: ${KAFKA_SERVICE_NAME}
+  spec:
+   accessModes:
+     - ${PV_ACCESSMODES}
+   capacity:
+     storage: ${PV_STORAGE}
+   nfs:
+     path: ${PV_NFS_PATH}/data-kafka-2
+     server: ${PV_NFS_SERVER}
+
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${KAFKA_SERVICE_NAME}-headless
+    labels:
+      app: ${KAFKA_SERVICE_NAME}
+  spec:
+    type: ClusterIP
+    clusterIP: None
+    ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+    selector:
+      app: ${KAFKA_SERVICE_NAME}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${KAFKA_SERVICE_NAME}
+    labels:
+      app: ${KAFKA_SERVICE_NAME}
+  spec:
+    type: ClusterIP
+    ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+    selector:
+      app: ${KAFKA_SERVICE_NAME}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${KAFKA_SERVICE_NAME}-manager
+    labels:
+      app: ${KAFKA_SERVICE_NAME}-manager
+  spec:
+    type: NodePort
+    ports:
+    - name: kafka
+      port: 9000
+      targetPort: 9000
+      nodePort: ${KAFKA_MANAGER_NODEPORT}
+    selector:
+      app: ${KAFKA_SERVICE_NAME}-manager
+
+- apiVersion: apps/v1beta1
+  kind: StatefulSet
+  metadata:
+    name: ${KAFKA_SERVICE_NAME}
+    labels:
+      app: ${KAFKA_SERVICE_NAME}
+  spec:
+    serviceName: ${KAFKA_SERVICE_NAME}-headless
+    podManagementPolicy: OrderedReady
+    replicas: 3
+    updateStrategy:
+      type: "RollingUpdate"
+    template:
+      metadata:
+        name: "${KAFKA_SERVICE_NAME}"
+        labels:
+          app: ${KAFKA_SERVICE_NAME}
+      spec:
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - key: "app"
+                      operator: In
+                      values:
+                        - ${KAFKA_SERVICE_NAME}
+                topologyKey: "kubernetes.io/hostname"      
+        containers:
+        - name: ${KAFKA_SERVICE_NAME}
+          image: ${IMAGE_NAME}:${IMAGE_VERSION}
+          imagePullPolicy: "IfNotPresent"
+          resources:
+            limits:
+              memory: ${MEMORY_LIMIT}
+          env:
+          - name: MY_POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: MY_POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: KAFKA_CFG_ZOOKEEPER_CONNECT
+            value: ${KAFKA_CFG_ZOOKEEPER_CONNECT}
+          - name: KAFKA_PORT_NUMBER
+            value: "9092"
+          - name: KAFKA_CFG_LISTENERS
+            value: "PLAINTEXT://:$(KAFKA_PORT_NUMBER)"
+          - name: KAFKA_CFG_ADVERTISED_LISTENERS
+            value: 'PLAINTEXT://$(MY_POD_NAME).${KAFKA_SERVICE_NAME}-headless:$(KAFKA_PORT_NUMBER)'
+          - name: ALLOW_PLAINTEXT_LISTENER
+            value: "yes"
+          - name: KAFKA_HEAP_OPTS
+            value: "-Xmx1000m -Xms1000m"
+          - name: KAFKA_CFG_LOGS_DIRS
+            value: /opt/bitnami/kafka/data
+          - name: JMX_PORT
+            value: "9988"
+          ports:
+          - name: kafka
+            containerPort: 9092
+          volumeMounts:
+          - name: ${KAFKA_SERVICE_NAME}-data
+            mountPath: /bitnami/kafka
+    volumeClaimTemplates:
+      - metadata:
+          name: ${KAFKA_SERVICE_NAME}-data
+        spec:
+          accessModes:
+            - "${PVC_ACCESSMODES}"
+          resources:
+            requests:
+              storage: ${PVC_STORAGE}
+    triggers:
+    - imageChangeParams:
+        automatic: true
+        containerNames:
+        - ${KAFKA_SERVICE_NAME}
+        from:
+          kind: ImageStreamTag
+          name: ${IMAGE_NAME}:${IMAGE_VERSION}
+          namespace: openshift
+      type: ImageChange
+    - type: ConfigChange
+
+- apiVersion: apps/v1beta1
+  kind: Deployment
+  metadata:
+    name: ${KAFKA_SERVICE_NAME}-manager
+    labels:
+      app: ${KAFKA_SERVICE_NAME}-manager
+  spec:
+    replicas: 1
+    selector:
+      matchLabels:
+        app: ${KAFKA_SERVICE_NAME}-manager
+    template:
+      metadata:
+        labels:
+          app: ${KAFKA_SERVICE_NAME}-manager
+      spec:
+        containers:
+        - name: ${KAFKA_SERVICE_NAME}-manager
+          image: zenko/kafka-manager:1.3.3.22
+          imagePullPolicy: IfNotPresent
+          ports:
+          - name: kafka-manager
+            containerPort: 9000
+            protocol: TCP
+          env:
+          - name: ZK_HOSTS
+            value: ${KAFKA_CFG_ZOOKEEPER_CONNECT}
+          resources:
+            limits:
+              memory: ${MEMORY_LIMIT}
+
+parameters:
+- description: Kafka 服务名称。
+  displayName: Kafka Service Name
+  name: KAFKA_SERVICE_NAME
+  required: true
+  value: kafka
+- description: Kafka 所使用的zookeeper连接地址。
+  displayName: Kafka connect zookeeper host
+  name: KAFKA_CFG_ZOOKEEPER_CONNECT
+  required: true
+  value: "zookeeper:2181"
+- description: Kafka 所使用镜像名称。
+  displayName: Name of Kafka Image
+  name: IMAGE_NAME
+  required: true
+  value: docker.io/bitnami/kafka
+- description: Kafka 所使用镜像版本。
+  displayName: Version of Kafka Image
+  name: IMAGE_VERSION
+  required: true
+  value: 2.3.0-debian-9-r4
+- description: Kafka manager 的外部暴露端口。
+  displayName: Kafka manager nodePort
+  name: KAFKA_MANAGER_NODEPORT
+  required: true
+  value: "30900"
+- description: NFS服务器的地址。
+  displayName: NFS server
+  name: PV_NFS_SERVER
+  required: true
+- description: NFS服务器的存储路径。
+  displayName: NFS path
+  name: PV_NFS_PATH
+  required: true
+  value: /mnt/scq_test/kafka
+- description: PersistentVolume的访问模式(ReadWriteMany, ReadWriteOnce or ReadOnlyMany)。
+  displayName: PersistentVolume accessModes
+  name: PV_ACCESSMODES
+  required: true
+  value: ReadWriteMany
+- description: PersistentVolume的所需存储空间大小。
+  displayName: PersistentVolume capacity
+  name: PV_STORAGE
+  required: true
+  value: 2G
+- description: PersistentVolumeClaim的访问模式(ReadWriteMany, ReadWriteOnce or ReadOnlyMany)。
+  displayName: PersistentVolumeClaim accessModes
+  name: PVC_ACCESSMODES
+  required: true
+  value: ReadWriteMany
+- description: PersistentVolumeClaim的所需存储空间大小。
+  displayName: PersistentVolumeClaim capacity
+  name: PVC_STORAGE
+  required: true
+  value: 2G
+- description: Kafka 可以使用的最大内存。
+  displayName: Memory Limit
+  name: MEMORY_LIMIT
+  required: true
+  value: 1024M

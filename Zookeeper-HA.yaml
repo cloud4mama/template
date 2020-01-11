@@ -1,0 +1,239 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+labels:
+  template: zookeeper-persistent-template
+message: |-
+  The following service(s) have been created in your project: ${ZOOKEEPER_SERVICE_NAME}.
+
+  For more information about using this template, including OpenShift considerations, see http://lxkaka.wang/2019/10/25/k8s-kafka/.
+metadata:
+  annotations:
+    description: |-
+      see http://lxkaka.wang/2019/10/25/k8s-kafka/.
+
+      WARNING: Any data stored will be lost upon pod destruction. Only use this template for testing
+    iconClass: icon-zookeeper
+    openshift.io/display-name: Zookeeper (HA)
+    openshift.io/documentation-url: http://lxkaka.wang/2019/10/25/k8s-kafka/
+    openshift.io/long-description: This template provides a standalone Zookeeper server.
+    openshift.io/provider-display-name: Red Hat, Inc.
+    openshift.io/support-url: https://access.redhat.com
+    tags: database,zookeeper
+  name: zookeeper-ha
+  namespace: openshift
+
+objects:
+- apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+     name: pv-${ZOOKEEPER_SERVICE_NAME}-0
+     labels:
+       app: ${ZOOKEEPER_SERVICE_NAME}
+  spec:
+   accessModes:
+     - ${PV_ACCESSMODES}
+   capacity:
+     storage: ${PV_STORAGE}
+   nfs:
+     path: ${PV_NFS_PATH}/data-zookeeper-0
+     server: ${PV_NFS_SERVER}
+- apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+     name: pv-${ZOOKEEPER_SERVICE_NAME}-1
+     labels:
+       app: ${ZOOKEEPER_SERVICE_NAME}
+  spec:
+   accessModes:
+     - ${PV_ACCESSMODES}
+   capacity:
+     storage: ${PV_STORAGE}
+   nfs:
+     path: ${PV_NFS_PATH}/data-zookeeper-1
+     server: ${PV_NFS_SERVER}
+- apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+     name: pv-${ZOOKEEPER_SERVICE_NAME}-2
+     labels:
+       app: ${ZOOKEEPER_SERVICE_NAME}
+  spec:
+   accessModes:
+     - ${PV_ACCESSMODES}
+   capacity:
+     storage: ${PV_STORAGE}
+   nfs:
+     path: ${PV_NFS_PATH}/data-zookeeper-2
+     server: ${PV_NFS_SERVER}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${ZOOKEEPER_SERVICE_NAME}-headless
+    labels:
+      app: ${ZOOKEEPER_SERVICE_NAME}
+  spec:
+    ports:
+    - name: client
+      port: 2181
+    - name: follower
+      port: 2888
+    - name: election
+      port: 3888
+    clusterIP: None
+    selector:
+      app: ${ZOOKEEPER_SERVICE_NAME}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${ZOOKEEPER_SERVICE_NAME}
+    labels:
+      app: ${ZOOKEEPER_SERVICE_NAME}
+  spec:
+    ports:
+    - name: client
+      port: 2181
+    - name: follower
+      port: 2888
+    - name: election
+      port: 3888
+    selector:
+      app: ${ZOOKEEPER_SERVICE_NAME}
+- apiVersion: apps/v1beta1
+  kind: StatefulSet
+  metadata:
+    name: ${ZOOKEEPER_SERVICE_NAME}
+  spec:
+    selector:
+      matchLabels:
+        app: ${ZOOKEEPER_SERVICE_NAME}
+    serviceName: ${ZOOKEEPER_SERVICE_NAME}-headless
+    replicas: 3
+    updateStrategy:
+      type: RollingUpdate
+    podManagementPolicy: OrderedReady
+    template:
+      metadata:
+        labels:
+          app: ${ZOOKEEPER_SERVICE_NAME}
+      spec:
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - key: "app"
+                      operator: In
+                      values:
+                        - ${ZOOKEEPER_SERVICE_NAME}
+                topologyKey: "kubernetes.io/hostname"
+        containers:
+        - name: ${ZOOKEEPER_SERVICE_NAME}
+          imagePullPolicy: IfNotPresent
+          resources:
+            limits:
+              memory: ${MEMORY_LIMIT}
+          image: ${IMAGE_NAME}:${IMAGE_VERSION}
+          command:
+            - sh
+            - -c
+            - "start-zookeeper \
+                    --servers=3 \
+                    --data_dir=/var/lib/zookeeper/data \
+                    --data_log_dir=/var/lib/zookeeper/data/log \
+                    --conf_dir=/opt/zookeeper/conf \
+                    --client_port=2181 \
+                    --election_port=3888 \
+                    --server_port=2888 \
+                    --tick_time=2000 \
+                    --init_limit=10 \
+                    --sync_limit=5 \
+                    --heap=512M \
+                    --max_client_cnxns=60 \
+                    --snap_retain_count=3 \
+                    --purge_interval=12 \
+                    --max_session_timeout=40000 \
+                    --min_session_timeout=4000 \
+                    --log_level=INFO"
+          ports:
+            - containerPort: 2181
+              name: client
+            - containerPort: 2888
+              name: follower
+            - containerPort: 3888
+              name: election
+          volumeMounts:
+          - name: ${ZOOKEEPER_SERVICE_NAME}-data
+            mountPath: /var/lib/zookeeper
+        securityContext:
+          runAsUser: 1000
+          fsGroup: 1000
+    volumeClaimTemplates:
+    - metadata:
+        name: ${ZOOKEEPER_SERVICE_NAME}-data
+      spec:
+        accessModes: [ "${PVC_ACCESSMODES}" ]
+        resources:
+          requests:
+            storage: ${PVC_STORAGE}
+    triggers:
+    - imageChangeParams:
+        automatic: true
+        containerNames:
+        - ${ZOOKEEPER_SERVICE_NAME}
+        from:
+          kind: ImageStreamTag
+          name: ${IMAGE_NAME}:${IMAGE_VERSION}
+          namespace: openshift
+      type: ImageChange
+    - type: ConfigChange
+
+parameters:
+- description: Zookeeper 服务名称。
+  displayName: Zookeeper Service Name
+  name: ZOOKEEPER_SERVICE_NAME
+  required: true
+  value: zookeeper
+- description: Zookeeper 所使用镜像名称。
+  displayName: Name of Zookeeper Image
+  name: IMAGE_NAME
+  required: true
+  value: registry.cn-hangzhou.aliyuncs.com/k8s-app-image/kubernetes-zookeeper
+- description: Zookeeper 所使用镜像版本。
+  displayName: Version of Zookeeper Image
+  name: IMAGE_VERSION
+  required: true
+  value: 1.0-3.4.10
+- description: NFS服务器的地址。
+  displayName: NFS server
+  name: PV_NFS_SERVER
+  required: true
+- description: NFS服务器的存储路径。
+  displayName: NFS path
+  name: PV_NFS_PATH
+  required: true
+  value: /mnt/scq_test/zookeeper
+- description: PersistentVolume的访问模式(ReadWriteMany, ReadWriteOnce or ReadOnlyMany)。
+  displayName: PersistentVolume accessModes
+  name: PV_ACCESSMODES
+  required: true
+  value: ReadWriteMany
+- description: PersistentVolume的所需存储空间大小。
+  displayName: PersistentVolume capacity
+  name: PV_STORAGE
+  required: true
+  value: 2G
+- description: PersistentVolumeClaim的访问模式(ReadWriteMany, ReadWriteOnce or ReadOnlyMany)。
+  displayName: PersistentVolumeClaim accessModes
+  name: PVC_ACCESSMODES
+  required: true
+  value: ReadWriteMany
+- description: PersistentVolumeClaim的所需存储空间大小。
+  displayName: PersistentVolumeClaim capacity
+  name: PVC_STORAGE
+  required: true
+  value: 2G
+- description: Zookeeper 可以使用的最大内存。
+  displayName: Memory Limit
+  name: MEMORY_LIMIT
+  required: true
+  value: 512M
